@@ -4,8 +4,8 @@ from pprint import pprint
 
 import torch
 
-from telemetry.fingerprint import NOT_AVAILABLE
-from telemetry.toy_model import run_toy_model
+from .fingerprint import NOT_AVAILABLE
+from .toy_model import run_toy_model
 
 BYTES_PER_MB = 2**20
 
