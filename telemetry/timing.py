@@ -29,15 +29,18 @@ def _time_once_cuda(fn):
     return start.elapsed_time(end)  # already in milliseconds
 
 
-def time_callable(fn, steps, warmups=3, repeats=10, measure=None):
+def time_callable(fn, steps, warmups=3, repeats=10, measure=None, min_duration_s=0.0):
     """Time `fn()` and return a metrics dict ready for a run-record.
 
     `steps` is not passed to `fn`; it is only used to compute per-step time.
     `measure`, if given, is a context manager entered around the timed repeats
     only (not the warm-ups), e.g. a GpuSampler, so it sees steady-state runs.
+    Runs at least `repeats` times, and keeps going until the timed section has
+    lasted `min_duration_s` of wall time; `repeats` in the result is the count
+    that actually ran.
     """
-    if steps < 1 or warmups < 0 or repeats < 1:
-        raise ValueError("need steps >= 1, warmups >= 0, repeats >= 1")
+    if steps < 1 or warmups < 0 or repeats < 1 or min_duration_s < 0:
+        raise ValueError("need steps >= 1, warmups >= 0, repeats >= 1, min_duration_s >= 0")
 
     use_cuda = torch.cuda.is_available()
     time_once = _time_once_cuda if use_cuda else _time_once_cpu
@@ -45,8 +48,15 @@ def time_callable(fn, steps, warmups=3, repeats=10, measure=None):
     for _ in range(warmups):
         fn()
 
+    samples_ms = []
     with measure or contextlib.nullcontext():
-        samples_ms = [time_once(fn) for _ in range(repeats)]
+        # Clock starts inside `measure`, so sampler start-up isn't counted.
+        start = time.perf_counter()
+        while len(samples_ms) < repeats or time.perf_counter() - start < min_duration_s:
+            samples_ms.append(time_once(fn))
+        measured_s = time.perf_counter() - start
+    # Every sample is one complete run of the same work, so the median is still
+    # "time per run" however many there are; more repeats only tighten it.
     median_ms = statistics.median(samples_ms)
 
     return {
@@ -58,7 +68,12 @@ def time_callable(fn, steps, warmups=3, repeats=10, measure=None):
         "device": "cuda" if use_cuda else "cpu",
         "timer": "cuda_event" if use_cuda else "perf_counter",
         "warmups": warmups,
-        "repeats": repeats,
+        "repeats": len(samples_ms),
+        "min_repeats": repeats,
+        "min_duration_s": float(min_duration_s),
+        # Wall time of the whole timed section, including gaps between runs.
+        # Not median_ms * repeats; it is the window the GPU sampler saw.
+        "measured_s": measured_s,
     }
 
 

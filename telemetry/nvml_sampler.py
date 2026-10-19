@@ -8,7 +8,7 @@ from pprint import pprint
 from .fingerprint import NOT_AVAILABLE
 from .toy_model import run_toy_model
 
-DEFAULT_INTERVAL_MS = 50
+DEFAULT_INTERVAL_MS = 50.0
 # Metric name -> (summary key prefix, unit suffix). Defines the summary's keys.
 METRICS = {
     "util": ("util", "pct"),
@@ -39,7 +39,8 @@ class GpuSampler:
     def __init__(self, interval_ms=DEFAULT_INTERVAL_MS, index=0):
         if interval_ms <= 0:
             raise ValueError(f"interval_ms must be > 0, got {interval_ms}")
-        self.interval_s = interval_ms / 1000.0
+        self.interval_ms = float(interval_ms)
+        self.interval_s = self.interval_ms / 1000.0
         self.index = index
         # Raw samples from the last run: dicts of t_s plus one value per metric
         # (None where the GPU doesn't report that metric).
