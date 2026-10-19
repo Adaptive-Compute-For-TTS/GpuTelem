@@ -1,5 +1,6 @@
 """Correct wall-time measurement for model runs, on CPU or CUDA."""
 
+import contextlib
 import statistics
 import time
 from functools import partial
@@ -28,10 +29,12 @@ def _time_once_cuda(fn):
     return start.elapsed_time(end)  # already in milliseconds
 
 
-def time_callable(fn, steps, warmups=3, repeats=10):
+def time_callable(fn, steps, warmups=3, repeats=10, measure=None):
     """Time `fn()` and return a metrics dict ready for a run-record.
 
     `steps` is not passed to `fn`; it is only used to compute per-step time.
+    `measure`, if given, is a context manager entered around the timed repeats
+    only (not the warm-ups), e.g. a GpuSampler, so it sees steady-state runs.
     """
     if steps < 1 or warmups < 0 or repeats < 1:
         raise ValueError("need steps >= 1, warmups >= 0, repeats >= 1")
@@ -42,7 +45,8 @@ def time_callable(fn, steps, warmups=3, repeats=10):
     for _ in range(warmups):
         fn()
 
-    samples_ms = [time_once(fn) for _ in range(repeats)]
+    with measure or contextlib.nullcontext():
+        samples_ms = [time_once(fn) for _ in range(repeats)]
     median_ms = statistics.median(samples_ms)
 
     return {

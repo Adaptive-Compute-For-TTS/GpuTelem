@@ -18,7 +18,8 @@ METRICS = {
 }
 
 
-def _summary_keys():
+def summary_keys():
+    """The metric keys of summary(), in order (excludes num_samples)."""
     keys = []
     for prefix, unit in METRICS.values():
         keys += [f"{prefix}_mean_{unit}", f"{prefix}_peak_{unit}"]
@@ -30,6 +31,9 @@ class GpuSampler:
 
     Works on machines without an NVIDIA GPU: start()/stop() do nothing and
     the summary is filled with placeholders.
+
+    Also usable as a context manager (`with sampler: ...`), which stops the
+    thread even if the body raises; read the result with summary() afterwards.
     """
 
     def __init__(self, interval_ms=DEFAULT_INTERVAL_MS, index=0):
@@ -67,8 +71,15 @@ class GpuSampler:
             self._pynvml = self._handle = None
         return self.summary()
 
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, *exc_info):
+        self.stop()
+
     def summary(self):
-        out = dict.fromkeys(_summary_keys(), NOT_AVAILABLE)
+        out = dict.fromkeys(summary_keys(), NOT_AVAILABLE)
         out["num_samples"] = len(self.samples)
         for name, (prefix, unit) in METRICS.items():
             values = [s[name] for s in self.samples if s[name] is not None]
