@@ -38,11 +38,18 @@ plus a CSV summary to `outputs/`.
 | `--repeats` | `10` | minimum timed runs per NFE |
 | `--min-duration-s` | `1.0` | keep repeating until the timed section lasts at least this long; `0` disables |
 | `--sample-interval-ms` | `50.0` | GPU sampling period |
+| `--profile` | off | also run one `torch.profiler` pass per NFE (kernel launches, op counts) |
 
 A timed section ends once **both** `--repeats` runs are done **and**
 `--min-duration-s` has passed, so fast configurations run more times than slow
 ones. The minimum duration exists so the GPU sampler sees enough of the run to
 be meaningful (NVML's own utilization window is up to 1 s).
+
+`--profile` is off by default because the profiler instruments every op and
+kernel launch, which slows the run and inflates exactly the launch overhead it
+counts. Use it as an occasional characterization pass (e.g. once per model or
+hardware change), not on every sweep. Its numbers come from a separate run
+after the measured ones, so it never affects timing, memory or GPU stats.
 
 Each module also has a small demo: `python -m telemetry.<module>`.
 
@@ -57,6 +64,7 @@ All live in `telemetry/`.
 | `timing.py` | `time_callable()`: warm-ups, then timed repeats (CUDA events on GPU, `perf_counter` on CPU) |
 | `memory.py` | `reset()` / `read_peak()`: peak allocated and reserved CUDA memory |
 | `nvml_sampler.py` | `GpuSampler`: background thread polling NVML; summarizes mean/peak per metric |
+| `profiler.py` | `profile_callable()`: one `torch.profiler` run; kernel-launch and op counts, top ops by time |
 | `run_sweep.py` | the pipeline: runs everything above for each NFE and writes the outputs |
 | `toy_model.py` | stand-in model: an Euler flow-matching loop whose cost scales with NFE |
 
@@ -64,6 +72,7 @@ What each measurement covers, per NFE:
 
 - **memory**: warm-ups and timed repeats. One-time allocations are real memory the run needs.
 - **timing** and **gpu**: timed repeats only. Warm-ups (clock ramp-up, one-time init) would skew means.
+- **profile** (with `--profile`): one extra run after all of the above, under the profiler.
 
 ## Output files
 
@@ -149,7 +158,7 @@ Example (from a CPU-only machine, so GPU fields are `"n/a"`):
 | `schema_version` | int | version of this format |
 | `config` | object | what was run |
 | `fingerprint` | object | where it ran |
-| `metrics` | object | what was measured |
+| `metrics` | object | what was measured: `timing`, `memory`, `gpu`, and `profile` only when the sweep ran with `--profile` (the key is absent otherwise) |
 
 ### `config`
 
@@ -217,6 +226,33 @@ Summary of NVML samples taken every `interval_ms` during the timed repeats.
 | `num_samples` | int | samples taken; `0` with no GPU. Check this before trusting the means |
 | `interval_ms` | float | sampling period |
 
+### `metrics.profile` (only with `--profile`)
+
+One run of the model under `torch.profiler`. Counts are deterministic for a
+given NFE, so one run is enough. Its times include profiler overhead; use
+`metrics.timing` for timing.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `steps` | int | steps per run (equals `config.nfe`) |
+| `device` | str | `cuda` or `cpu` |
+| `warmups` | int | unprofiled runs first (`0` in sweeps: the model is already warm) |
+| `cpu_op_calls` | int | top-level `aten::` ops the Python code called (nested ops like `aten::matmul` → `aten::mm` count once) |
+| `distinct_cpu_ops` | int | distinct names among those |
+| `kernel_launches` | int | GPU kernels launched (excludes memcpy/memset) |
+| `distinct_kernels` | int | distinct kernel names |
+| `gpu_kernel_time_ms` | float | summed GPU execution time of those kernels |
+| `top_ops` | list | up to 5 `aten::` ops ranked by self time (GPU time on CUDA, CPU time otherwise); each `{name, calls, self_cpu_time_ms, self_gpu_time_ms}` |
+
+The three kernel fields and `self_gpu_time_ms` are `"n/a"` on CPU, and also on
+a GPU if CUDA tracing is unavailable (no kernels recorded), rather than a
+misleading `0`. For the toy model, `cpu_op_calls` is `4 × NFE + 7`, and
+`kernel_launches` should be about 4 per step.
+
+`self_` times are each op's own cost, excluding ops it called, so they never
+count the same work twice. `calls` counts every invocation, nested ones
+included.
+
 ## Sweep CSV columns
 
 One row per NFE, in this order:
@@ -225,6 +261,10 @@ One row per NFE, in this order:
 peak_allocated_mb, peak_reserved_mb, util_mean_pct, util_peak_pct,
 power_mean_w, power_peak_w, sm_clock_mean_mhz, sm_clock_peak_mhz, temp_mean_c,
 temp_peak_c, gpu_num_samples, run_id`
+
+With `--profile`, four more columns come just before `run_id`:
+`kernel_launches, distinct_kernels, gpu_kernel_time_ms, cpu_op_calls`
+(`top_ops` is a list, so it is only in the JSON).
 
 Each column has the same meaning as the run-record field of the same name;
 `gpu_num_samples` is `metrics.gpu.num_samples`. Use `run_id` to find the full
