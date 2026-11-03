@@ -42,9 +42,10 @@ def get_runtime(model=DEFAULT_MODEL, precision=DEFAULT_PRECISION):
     return _runtime
 
 
-def run_dots(text, num_steps, seed=42, guidance_scale=1.2, speaker_scale=1.5):
+def run_dots(text, num_steps, seed=42, guidance_scale=1.2, speaker_scale=1.5,
+             model=DEFAULT_MODEL):
     """Generate speech for `text` with `num_steps` ODE steps; return dots.tts's result dict."""
-    rt = get_runtime()
+    rt = get_runtime(model)
 
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
