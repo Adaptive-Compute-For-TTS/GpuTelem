@@ -5,8 +5,21 @@ text-to-speech. It instruments the **dots.tts** model and records per-run GPU
 statistics (hardware/runtime fingerprint, timing, memory, utilization) so that
 runs can be compared and reproduced.
 
-The harness currently drives a toy flow-matching model (`toy_model.py`) as a
-stand-in for dots.tts. The run-record format below is the same either way.
+There are two drivers that share the same measurement modules and run-record
+format:
+
+- **`run_tts_eval`**: real dots.tts (`dots-studio/dots.tts-soar`) over a set
+  of benchmark prompts, one measured generation per prompt.
+- **`run_sweep`**: a toy flow-matching model (`toy_model.py`) swept over NFE
+  values. It needs no model download, so it is used to develop and check the
+  harness itself.
+
+## Status
+
+- Done: fingerprint, timing, peak memory, NVML sampler, profiler, run-records,
+  and the NFE sweep on the toy model.
+- Done: `dots_model.py` wrapper and the `run_tts_eval` driver for real dots.tts.
+- Next: first `run_tts_eval` run on the GPU box with the benchmark prompts file.
 
 ## Setup
 
@@ -19,7 +32,60 @@ pip install torch nvidia-ml-py
 `nvidia-ml-py` provides the `pynvml` module. Both it and a GPU are optional:
 on a CPU-only machine every module still runs and fills GPU fields with `"n/a"`.
 
-## Running a sweep
+`run_tts_eval` also needs the `dots_tts` package (it must provide
+`dots_tts.runtime.DotsTtsRuntime`) and a CUDA GPU that can hold the 2B model in
+bf16. Without `dots_tts` the rest of the harness still imports and runs;
+only the dots.tts entry points fail, with a clear message.
+
+## Running the dots.tts eval
+
+On a machine with dots.tts installed, from the repo root:
+
+```
+python -m telemetry.run_tts_eval --prompts prompts.json --num-steps 10
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--prompts` | required | JSON file of benchmark prompts (format below) |
+| `--num-steps` | `10` | ODE steps per generation; recorded as `nfe` |
+| `--model` | `dots-studio/dots.tts-soar` | dots.tts checkpoint |
+| `--out-dir` | `outputs/` | where run-records and the CSV are written |
+
+The prompts file is a JSON **list**; every entry needs these four keys:
+
+```json
+[
+  {"id": "short_001", "text": "Hello there.", "length_bucket": "short", "category": "greeting"}
+]
+```
+
+What the eval does:
+
+1. Loads the dots.tts runtime once (`get_runtime()` caches it for the process).
+2. Runs one warmup generation on the first prompt and discards it, so one-time
+   costs (cuBLAS/cuDNN setup, kernel loading, allocator growth, lazy init)
+   don't land on the first measured prompt.
+3. For each prompt: reset peak memory, start the GPU sampler, time **one**
+   `run_dots()` call with the CUDA-event timer, stop the sampler, read peak memory.
+4. Saves one run-record per prompt and appends a row to the summary CSV,
+   flushed after every prompt so a crash keeps finished rows.
+
+Each prompt gets one generation rather than repeats plus a median, as in the
+sweep: a real generation lasts seconds, which already outweighs timer noise and
+gives the sampler many readings. With a fixed seed (42) a repeat would just
+redo the same work. The variation this eval is about is between prompts.
+
+Peak VRAM includes the model weights, which are the same for every prompt, so
+differences between rows are per-prompt activation memory.
+
+To smoke-test the wrapper on its own (one short sentence at 10 steps):
+
+```
+python -m telemetry.dots_model
+```
+
+## Running a sweep (toy model)
 
 Run from the repo root (the `-m` form is required so package imports resolve):
 
@@ -65,10 +131,13 @@ All live in `telemetry/`.
 | `memory.py` | `reset()` / `read_peak()`: peak allocated and reserved CUDA memory |
 | `nvml_sampler.py` | `GpuSampler`: background thread polling NVML; summarizes mean/peak per metric |
 | `profiler.py` | `profile_callable()`: one `torch.profiler` run; kernel-launch and op counts, top ops by time |
-| `run_sweep.py` | the pipeline: runs everything above for each NFE and writes the outputs |
+| `dots_model.py` | `get_runtime()` (load-once dots.tts runtime), `run_dots()` (seeded generation), `audio_duration_s()` |
+| `run_tts_eval.py` | the dots.tts eval: one measured generation per benchmark prompt |
+| `run_sweep.py` | the toy pipeline: runs the measurements for each NFE and writes the outputs |
 | `toy_model.py` | stand-in model: an Euler flow-matching loop whose cost scales with NFE |
 
-What each measurement covers, per NFE:
+What each measurement covers, per NFE in the sweep (the eval has no repeats,
+so all of its measurements cover the one generation):
 
 - **memory**: warm-ups and timed repeats. One-time allocations are real memory the run needs.
 - **timing** and **gpu**: timed repeats only. Warm-ups (clock ramp-up, one-time init) would skew means.
@@ -76,10 +145,11 @@ What each measurement covers, per NFE:
 
 ## Output files
 
-Both go to `outputs/` at the repo root, which is git-ignored.
+All go to `outputs/` at the repo root (git-ignored) unless `--out-dir` is given.
 
-- `run_<run_id>.json`: one run-record per NFE (schema below)
+- `run_<run_id>.json`: one run-record per sweep NFE or per eval prompt (schema below)
 - `sweep_<sweep_id>.csv`: one row per NFE, flattened from the run-records
+- `tts_eval_<eval_id>.csv`: one row per prompt (columns below)
 
 ## Run-record schema (`schema_version: 1`)
 
@@ -158,15 +228,26 @@ Example (from a CPU-only machine, so GPU fields are `"n/a"`):
 | `schema_version` | int | version of this format |
 | `config` | object | what was run |
 | `fingerprint` | object | where it ran |
-| `metrics` | object | what was measured: `timing`, `memory`, `gpu`, and `profile` only when the sweep ran with `--profile` (the key is absent otherwise) |
+| `metrics` | object | what was measured: `timing`, `memory`, `gpu`; `profile` only when the sweep ran with `--profile`; `audio` only in eval records |
 
 ### `config`
 
+Sweep records:
+
 | Field | Type | Meaning |
 |---|---|---|
-| `model` | str | model name (`"toy"` for now) |
+| `model` | str | `"toy"` |
 | `nfe` | int | number of function evaluations (sampler steps) |
 | `sweep_id` | str | `YYYYMMDD_HHMMSS` of the sweep this run belongs to; shared by all its runs |
+
+Eval records:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `model` | str | dots.tts checkpoint, e.g. `dots-studio/dots.tts-soar` |
+| `nfe` | int | `--num-steps` passed to dots.tts |
+| `prompt_id`, `text`, `length_bucket`, `category` | str | copied from the prompts file |
+| `eval_id` | str | `YYYYMMDD_HHMMSS` of the eval this run belongs to; shared by all its runs |
 
 ### `fingerprint`
 
@@ -203,6 +284,14 @@ more repeats only make it more precise. `measured_s` is not
 `median_ms * repeats`. It includes per-run overhead and is the window the GPU
 sampler observed.
 
+Eval records always have `warmups: 0` and `repeats: 1` (the one discarded
+warmup happens once, before the first prompt), and add two fields:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `latency_s` | float | the measured generation time (`median_ms / 1000`) |
+| `model_time_used_s` | float | dots.tts's own `time_used` for the same call; may cover a narrower span than `latency_s` |
+
 ### `metrics.memory`
 
 | Field | Type | Meaning |
@@ -225,6 +314,14 @@ Summary of NVML samples taken every `interval_ms` during the timed repeats.
 | `temp_mean_c`, `temp_peak_c` | float, int | GPU core temperature |
 | `num_samples` | int | samples taken; `0` with no GPU. Check this before trusting the means |
 | `interval_ms` | float | sampling period |
+
+### `metrics.audio` (eval records only)
+
+| Field | Type | Meaning |
+|---|---|---|
+| `audio_s` | float | length of the generated audio: samples / `sample_rate` |
+| `rtf` | float | real-time factor as reported by dots.tts |
+| `sample_rate` | int | Hz |
 
 ### `metrics.profile` (only with `--profile`)
 
@@ -269,3 +366,12 @@ With `--profile`, four more columns come just before `run_id`:
 Each column has the same meaning as the run-record field of the same name;
 `gpu_num_samples` is `metrics.gpu.num_samples`. Use `run_id` to find the full
 JSON record for a row.
+
+## Eval CSV columns
+
+One row per prompt, in this order:
+
+`run_id, prompt_id, length_bucket, nfe, latency_s, audio_s, rtf, peak_vram_mb`
+
+`latency_s` is `metrics.timing.latency_s`, `audio_s` and `rtf` come from
+`metrics.audio`, and `peak_vram_mb` is `metrics.memory.peak_allocated_mb`.
